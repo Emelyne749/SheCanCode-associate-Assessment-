@@ -4,7 +4,7 @@ This challenge is designed to test your ability to bridge Computer Science funda
 
 ## 1. Business Context
 
-> **Client:** IgirePay Transaction Ltd._ (A fast-growing Payment Processor).
+> **Client:** IgirePay Technologies Ltd._ (A fast-growing Payment Processor).
 
 ### The Problem
 
