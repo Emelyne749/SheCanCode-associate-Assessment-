@@ -26,19 +26,20 @@ Client                        Idempotency Gateway                 Payment Proces
   |   {"amount":100,"currency":"RWF"}  |                                  |
   |                                    |                                  |
   |                        ┌───────────┴───────────┐                     |
-  |                        │  Key in store?         │                     |
+  |                        │  Key in MySQL/memory?  │                     |
   |                        └───────────┬───────────┘                     |
   |                                    │                                  |
   |                        ┌───────────▼───────────┐                     |
   |         ┌──── NO ──────│   Insert KEY-A         │                     |
   |         │              │   State: IN_FLIGHT      │                     |
+  |         │              │   Saved to MySQL        │                     |
   |         │              └───────────────────────┘                     |
   |         │                                                             |
   |         │                          │──── process(request) ──────────>|
   |         │                          │<─── PaymentResponse ────────────|
   |         │                          │                                  |
   |         │              ┌───────────▼───────────┐                     |
-  |         │              │  Store response        │                     |
+  |         │              │  Update MySQL record   │                     |
   |         │              │  State: COMPLETED      │                     |
   |         │              └───────────────────────┘                     |
   |         │                                                             |
@@ -46,15 +47,13 @@ Client                        Idempotency Gateway                 Payment Proces
   |   {"status":"SUCCESS","message":   |                                  |
   |    "Charged 100 RWF", ...}         |                                  |
   |                                    |                                  |
-  |                                    |                                  |
-  |  ── SCENARIO A: Duplicate ──────────────────────────────────────── ──|
+  |  ── SCENARIO A: Duplicate ─────────────────────────────────────────  |
   |                                    |                                  |
   |── POST /process-payment ──────────>|                                  |
   |   Idempotency-Key: KEY-A (SAME)    |                                  |
   |   {"amount":100,"currency":"RWF"}  |                                  |
-  |                                    │                                  |
   |                        ┌───────────▼───────────┐                     |
-  |                        │  Key EXISTS            │                     |
+  |                        │  Key EXISTS in MySQL   │                     |
   |                        │  Hash matches          │                     |
   |                        │  State: COMPLETED      │                     |
   |                        └───────────────────────┘                     |
@@ -63,7 +62,7 @@ Client                        Idempotency Gateway                 Payment Proces
   |   X-Cache-Hit: true                |                                  |
   |   {same body as first response}    |                                  |
   |                                    |                                  |
-  |  ── SCENARIO B: Body Mismatch ──────────────────────────────────── ──|
+  |  ── SCENARIO B: Body Mismatch ─────────────────────────────────────  |
   |                                    |                                  |
   |── POST /process-payment ──────────>|                                  |
   |   Idempotency-Key: KEY-A (SAME)    |                                  |
@@ -76,14 +75,14 @@ Client                        Idempotency Gateway                 Payment Proces
   |   "Idempotency key already used    |                                  |
   |    for a different request body."  |                                  |
   |                                    |                                  |
-  |  ── SCENARIO C: In-Flight Race ─────────────────────────────────── ──|
+  |  ── SCENARIO C: In-Flight Race ────────────────────────────────────  |
   |                                    |                                  |
   |── Request A (KEY-B) ──────────────>|──── process(request) ──────────>|
   |                                    │     [2 sec delay ...]            |
   |── Request B (KEY-B, duplicate) ───>|                                  |
   |                        ┌───────────▼───────────┐                     |
   |                        │  Key EXISTS            │                     |
-  |                        │  State: IN_FLIGHT       │                     |
+  |                        │  State: IN_FLIGHT      │                     |
   |                        │  → awaitCompletion()   │                     |
   |                        └───────────────────────┘                     |
   |                                    │<── PaymentResponse ─────────────|
@@ -102,8 +101,20 @@ Client                        Idempotency Gateway                 Payment Proces
 |------|---------|
 | Java | 17 or higher |
 | Maven | 3.8+ |
+| MySQL | 8.0+ |
 
-> No database setup required. The service uses an in-memory `ConcurrentHashMap` as its idempotency store.
+### MySQL Setup
+
+1. Make sure MySQL is running on your machine
+2. Open `src/main/resources/application.properties`
+3. Update your credentials:
+
+```properties
+spring.datasource.username=root
+spring.datasource.password=yourpassword
+```
+
+> The database `idempotency_db` is created **automatically** on first run — no SQL script needed.
 
 ### Clone and Run
 
@@ -158,8 +169,6 @@ Submits a payment request. The idempotency layer guarantees the payment is proce
 | `amount` | number | Yes | Must be > 0 |
 | `currency` | string | Yes | Non-blank (e.g. "RWF", "USD") |
 
----
-
 #### Responses
 
 ##### `201 Created` — New Payment Processed
@@ -202,8 +211,6 @@ X-Cache-Hit: true
 }
 ```
 
----
-
 #### Full cURL Examples
 
 **First request:**
@@ -232,11 +239,7 @@ curl -X POST http://localhost:8080/process-payment \
 # Returns: 409 Conflict
 ```
 
----
-
 ### `GET /actuator/health`
-
-Returns the health status of the service.
 
 ```json
 {
@@ -248,28 +251,35 @@ Returns the health status of the service.
 
 ## Design Decisions
 
-### 1. In-Memory Store (`ConcurrentHashMap`)
+### 1. MySQL-Backed Persistence with JPA
 
-The idempotency store uses a `ConcurrentHashMap<String, IdempotencyRecord>`. This was chosen to keep the service dependency-free (no Redis or database needed to run) while providing the thread-safety guarantees required for correct concurrent behavior.
+Idempotency records are persisted to a MySQL database using Spring Data JPA. This means:
+- Records survive server restarts — a duplicate request after a restart still returns the cached response
+- The `idempotency_records` table is auto-created by Hibernate on startup (`ddl-auto=update`)
+- A unique index on `idempotency_key` enforces integrity at the database level
 
-**Key operation:** `putIfAbsent(key, record)` is atomic — it either inserts and returns `null` (first request), or returns the existing record (duplicate). This single atomic call eliminates the classic check-then-act race condition.
+### 2. Dual-Layer Store (MySQL + ConcurrentHashMap)
 
-### 2. SHA-256 Request Fingerprinting
+The store uses two layers working together:
+- **In-memory ConcurrentHashMap** — handles `IN_FLIGHT` state and concurrent duplicate detection within the same server instance. `putIfAbsent()` is atomic, eliminating check-then-act race conditions.
+- **MySQL** — provides durable persistence. On every completed payment, the result is written to MySQL so it survives restarts.
+
+When a request arrives, the in-memory layer is checked first (fast path), then MySQL (covers restart scenarios).
+
+### 3. SHA-256 Request Fingerprinting
 
 Rather than storing the raw request body, a **SHA-256 hash** of the canonicalized JSON is stored. This:
-- Reduces memory usage for large bodies
+- Reduces storage usage
 - Provides a deterministic, constant-size comparison value
 - Uses sorted JSON serialization so `{"a":1,"b":2}` and `{"b":2,"a":1}` produce the same hash
 
-### 3. In-Flight State + `synchronized` Monitor (Bonus Race Condition)
+### 4. In-Flight State + `synchronized` Monitor (Bonus Race Condition)
 
-Each `IdempotencyRecord` has a `state` field: `IN_FLIGHT` or `COMPLETED`. When a duplicate arrives while the original is still processing, instead of returning an error, the duplicate thread calls `awaitCompletion()` — which uses Java's built-in `Object.wait()/notifyAll()` to block efficiently until the original finishes. The duplicate then returns the original's result with `X-Cache-Hit: true`.
+Each `IdempotencyRecord` has a `state` field: `IN_FLIGHT` or `COMPLETED`. When a duplicate arrives while the original is still processing, the duplicate thread calls `awaitCompletion()` — which uses Java's built-in `Object.wait()/notifyAll()` to block until the original finishes, then returns the same result with `X-Cache-Hit: true`.
 
-This eliminates the double-processing race without requiring any external coordination mechanism.
+### 5. Immutable `PaymentRequest` with Value Equality
 
-### 4. Immutable `PaymentRequest` with Value Equality
-
-`PaymentRequest` is an immutable record with `equals()` based on amount + currency. This makes it safe to compare across threads and easy to reason about.
+`PaymentRequest` is immutable with `equals()` based on amount + currency, making it safe to compare across threads.
 
 ---
 
@@ -277,13 +287,11 @@ This eliminates the double-processing race without requiring any external coordi
 
 ### TTL-Based Automatic Eviction
 
-**What it is:** Idempotency records are automatically removed from memory after a configurable TTL (default: **24 hours**). A Spring `@Scheduled` background job runs every hour to purge expired entries.
+**What it is:** Idempotency records are automatically deleted from MySQL after a configurable TTL (default: **24 hours**). A Spring `@Scheduled` background job runs every hour to purge expired entries from both MySQL and the in-memory map.
 
 **Why it matters in a real Fintech system:**
 
-In production, a payment gateway processes thousands of transactions per day. Without automatic eviction, the idempotency store would grow indefinitely and eventually exhaust heap memory — causing an OutOfMemoryError that would crash the service.
-
-The 24-hour TTL is not arbitrary. It aligns with the industry-standard window during which clients are expected to retry a timed-out request. After 24 hours, a retry would almost certainly be a business error (not a legitimate retry), so it is correct to treat it as a new request.
+Without automatic eviction, the `idempotency_records` table grows indefinitely — causing slow queries and storage exhaustion in production. The 24-hour TTL aligns with the industry-standard retry window. After 24 hours, a retry is almost certainly a business error rather than a legitimate network retry.
 
 **Configuration** (in `application.properties`):
 
@@ -295,7 +303,7 @@ idempotency.ttl-hours=24
 idempotency.cleanup-interval-ms=3600000
 ```
 
-Both values are tunable without code changes, making the service easy to operate in different environments (e.g., a shorter TTL for a high-throughput staging environment).
+Both values are tunable without code changes, making the service easy to operate in different environments.
 
 ---
 
@@ -304,22 +312,30 @@ Both values are tunable without code changes, making the service easy to operate
 ```
 src/
 ├── main/java/com/igirepay/gateway/
-│   ├── IdempotencyGatewayApplication.java   # Entry point
+│   ├── IdempotencyGatewayApplication.java
 │   ├── config/
-│   │   └── AppConfig.java                   # Enables @Scheduled
+│   │   └── AppConfig.java                    # Enables @Scheduled
 │   ├── controller/
-│   │   ├── PaymentController.java           # POST /process-payment
-│   │   └── GlobalExceptionHandler.java      # Centralized error mapping
+│   │   ├── PaymentController.java            # POST /process-payment
+│   │   └── GlobalExceptionHandler.java       # Centralized error mapping
+│   ├── entity/
+│   │   └── IdempotencyRecordEntity.java      # JPA entity → MySQL table
 │   ├── model/
-│   │   ├── PaymentRequest.java              # Request body (immutable)
-│   │   ├── PaymentResponse.java             # Response body
-│   │   ├── IdempotencyRecord.java           # Store entry + state machine
-│   │   └── ErrorResponse.java              # Standard error body
+│   │   ├── PaymentRequest.java               # Request body (immutable)
+│   │   ├── PaymentResponse.java              # Response body
+│   │   ├── IdempotencyRecord.java            # In-memory state machine
+│   │   └── ErrorResponse.java               # Standard error body
+│   ├── repository/
+│   │   └── IdempotencyRepository.java        # Spring Data JPA repository
 │   └── service/
-│       ├── IdempotencyService.java          # Core idempotency logic
-│       ├── IdempotencyStore.java            # Thread-safe store + TTL eviction
-│       ├── PaymentService.java              # Payment simulation
-│       └── HashService.java                 # SHA-256 body fingerprinting
+│       ├── IdempotencyService.java           # Core idempotency logic
+│       ├── IdempotencyStore.java             # Dual-layer store (MySQL + memory)
+│       ├── PaymentService.java               # Payment simulation
+│       └── HashService.java                  # SHA-256 body fingerprinting
 └── test/java/com/igirepay/gateway/
-    └── IdempotencyGatewayIntegrationTest.java  # Integration tests
+    └── IdempotencyGatewayIntegrationTest.java
 ```
+
+---
+
+*Built for IgirePay Technologies Ltd. — Pay-Once Protocol challenge.*
